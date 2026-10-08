@@ -6,9 +6,17 @@
 //! rewound it), gray sidecars have no session-entry store — state persists
 //! per project directory at `~/.gray/todos/<sha1-of-cwd>.json`, written after
 //! every mutation and stable across sessions in the same cwd.
+//!
+//! `/todos` is interactive when the host grants `host.ask`: it opens a
+//! picker ("Toggle which todo?") whose options are every todo plus "just
+//! show", and toggles the picked id through the same path as the tool's
+//! `toggle` action. With no ask channel it falls back to the plain render.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -35,7 +43,29 @@ fn manifest() -> Value {
             }
         }],
         "commands": ["/todos"],
+        "capabilities": ["host.ask"],
     })
+}
+
+/// host/ask round-trip signature — the real one lives in `main` (writes the
+/// request to stdout, blocks on a pending channel); tests inject canned
+/// answers. Params are the full `host/ask` params object; returns the reply's
+/// `result`, or None on timeout.
+type Ask<'a> = dyn FnMut(&Value) -> Option<Value> + 'a;
+
+type Pending = Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>>;
+/// Internal cap on host/ask waits — under the host's outer TTL.
+const ASK_TTL: Duration = Duration::from_secs(300);
+const Q_TOGGLE: &str = "todo-toggle";
+const LABEL_JUST_SHOW: &str = "just show";
+
+/// First picked label out of a host/ask reply — None on absent/timeout/empty.
+fn picked_label(result: Option<&Value>, qid: &str) -> Option<String> {
+    result?
+        .pointer(&format!("/answers/{qid}/answers/0"))?
+        .as_str()
+        .map(String::from)
+        .filter(|s| !s.is_empty())
 }
 
 /// One todo item.
@@ -183,13 +213,8 @@ fn call_tool(name: &str, args: &Value, cwd: &str) -> Result<String, String> {
     }
 }
 
-/// `/todos` — render the list: done/total summary plus one checkbox line per
-/// todo.
-fn run_command(argv: &[&str], cwd: &str) -> String {
-    if !argv.is_empty() {
-        return "usage: /todos".into();
-    }
-    let state = load(&state_path(cwd));
+/// Render the list: done/total summary plus one checkbox line per todo.
+fn render_list(state: &State) -> String {
     if state.todos.is_empty() {
         return "No todos yet. Ask the agent to add some!".into();
     }
@@ -204,6 +229,57 @@ fn run_command(argv: &[&str], cwd: &str) -> String {
         ));
     }
     out.trim_end().to_string()
+}
+
+fn todo_label(t: &Todo) -> String {
+    format!("#{} {}", t.id, t.text)
+}
+
+/// `/todos` — interactive picker when host/ask works: toggle the picked todo
+/// (via the tool's `toggle` path) or pick "just show". Any ask failure —
+/// ungranted capability, timeout, empty answer — falls back to the render.
+fn run_command(argv: &[&str], cwd: &str, ask: &mut Ask) -> String {
+    if !argv.is_empty() {
+        return "usage: /todos".into();
+    }
+    let state = load(&state_path(cwd));
+    if state.todos.is_empty() {
+        return render_list(&state);
+    }
+    let mut options: Vec<Value> = state
+        .todos
+        .iter()
+        .map(|t| {
+            json!({
+                "label": todo_label(t),
+                "description": if t.done { "done" } else { "pending" },
+            })
+        })
+        .collect();
+    options.push(json!({
+        "label": LABEL_JUST_SHOW,
+        "description": "render the list, change nothing",
+    }));
+    let picked = ask(&json!({
+        "questions": [{
+            "id": Q_TOGGLE,
+            "header": "Todos",
+            "question": "Toggle which todo?",
+            "options": options,
+        }],
+        "blocking": true,
+    }));
+    let label = picked_label(picked.as_ref(), Q_TOGGLE).unwrap_or_default();
+    match state.todos.iter().find(|t| todo_label(t) == label) {
+        Some(t) => {
+            let id = t.id;
+            match call_tool("todo", &json!({"action": "toggle", "id": id}), cwd) {
+                Ok(text) => format!("{text}\n\n{}", render_list(&load(&state_path(cwd)))),
+                Err(e) => e,
+            }
+        }
+        None => render_list(&state),
+    }
 }
 
 /// SHA-1 (hex) of a string — used only to derive the per-cwd state filename,
@@ -256,7 +332,7 @@ fn sha1_hex(data: &str) -> String {
 
 /// One request → `Some(reply)`, or `None` for notifications. The bool asks
 /// the loop to exit after writing the reply.
-fn handle(req: &Value) -> (Option<Value>, bool) {
+fn handle(req: &Value, ask: &mut Ask) -> (Option<Value>, bool) {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -280,7 +356,7 @@ fn handle(req: &Value) -> (Option<Value>, bool) {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            json!({ "text": run_command(&argv, &session_cwd(&params)) })
+            json!({ "text": run_command(&argv, &session_cwd(&params), ask) })
         }
         "plugin/shutdown" => return (Some(json!({ "id": id, "result": {} })), true),
         _ => {
@@ -296,20 +372,68 @@ fn main() -> std::io::Result<()> {
         println!("{}", manifest());
         return Ok(());
     }
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
-        let (reply, exit) = handle(&req);
+    let stdout = Arc::new(Mutex::new(std::io::stdout()));
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let counter = Mutex::new(0u64);
+
+    // Reader thread: host answers (string id, no method) go to `pending`;
+    // host requests (id + method) go to the work channel. Notifications have
+    // no id and are dropped here, same as `handle` returning None.
+    let (work_tx, work_rx) = mpsc::channel::<Value>();
+    let reader_pending = pending.clone();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if let Some(id) = v.get("id").and_then(Value::as_str)
+                && v.get("method").is_none()
+            {
+                if let Some(tx) = reader_pending.lock().expect("pending").remove(id) {
+                    let _ = tx.send(v.get("result").cloned().unwrap_or(Value::Null));
+                }
+                continue;
+            }
+            if v.get("id").is_some() && work_tx.send(v).is_err() {
+                break;
+            }
+        }
+    });
+
+    // host/ask: write the request, block on the pending channel. Errors and
+    // timeouts surface as None → callers degrade to a text answer.
+    let mut ask = |params: &Value| -> Option<Value> {
+        let id = {
+            let mut n = counter.lock().expect("id counter");
+            *n += 1;
+            format!("q{n}")
+        };
+        let (tx, rx) = mpsc::channel();
+        pending.lock().expect("pending").insert(id.clone(), tx);
+        {
+            let req = json!({"id": id, "method": "host/ask", "params": params});
+            let mut o = stdout.lock().expect("stdout");
+            let _ = writeln!(o, "{req}");
+            let _ = o.flush();
+        }
+        let reply = rx.recv_timeout(ASK_TTL).ok();
+        pending.lock().expect("pending").remove(&id);
+        reply
+    };
+
+    for req in work_rx {
+        let (reply, exit) = handle(&req, &mut ask);
         if let Some(reply) = reply {
-            writeln!(stdout, "{reply}")?;
-            stdout.flush()?;
+            let mut o = stdout.lock().expect("stdout");
+            let _ = writeln!(o, "{reply}");
+            let _ = o.flush();
         }
         if exit {
             break;
         }
     }
+    // The reader thread is a detached stdin pump; returning ends the process
+    // with it — nothing to join.
     Ok(())
 }
 
@@ -318,7 +442,25 @@ mod tests {
     use super::*;
 
     fn call(method: &str, params: Value) -> Value {
-        handle(&json!({ "id": 1, "method": method, "params": params })).0.unwrap()
+        call_ask(method, params, &mut |_p: &Value| None)
+    }
+
+    fn call_ask(method: &str, params: Value, ask: &mut Ask) -> Value {
+        handle(&json!({ "id": 1, "method": method, "params": params }), ask)
+            .0
+            .unwrap()
+    }
+
+    /// Test asker: answers host/ask by picking option `i` of question 0.
+    fn picking(i: usize) -> impl FnMut(&Value) -> Option<Value> {
+        move |p: &Value| {
+            let q = &p["questions"][0];
+            let qid = q["id"].as_str().unwrap_or("q").to_string();
+            let label = q["options"][i]["label"].as_str()?.to_string();
+            let mut answers = serde_json::Map::new();
+            answers.insert(qid, json!({"answers": [label]}));
+            Some(json!({"answers": answers}))
+        }
     }
 
     /// Run `body` with GRAY_HOME pointed at a fresh temp dir. Serialized:
@@ -354,6 +496,7 @@ mod tests {
         assert_eq!(m["commands"], json!(["/todos"]));
         assert_eq!(m["tools"][0]["name"], "todo");
         assert_eq!(m["tools"][0]["parameters"]["required"], json!(["action"]));
+        assert_eq!(m["capabilities"], json!(["host.ask"]));
     }
 
     #[test]
@@ -427,8 +570,44 @@ mod tests {
     }
 
     #[test]
+    fn todos_command_picker_toggles_selected() {
+        with_home(|_| {
+            let cwd = "/tmp/proj";
+            tool("add", json!({"text": "one"}), cwd);
+            tool("add", json!({"text": "two"}), cwd);
+            let mut ask = picking(1); // second todo
+            let r = call_ask(
+                "command/run",
+                json!({"name": "/todos", "argv": [], "session": {"id": "s", "cwd": cwd}}),
+                &mut ask,
+            );
+            let text = r["result"]["text"].as_str().unwrap();
+            assert!(text.contains("Todo #2 completed"), "{text}");
+            assert!(text.contains("✓ #2 two") && text.contains("○ #1 one"), "{text}");
+        });
+    }
+
+    #[test]
+    fn todos_command_picker_just_show_changes_nothing() {
+        with_home(|_| {
+            let cwd = "/tmp/proj";
+            tool("add", json!({"text": "one"}), cwd);
+            let mut ask = picking(1); // last option = "just show"
+            let r = call_ask(
+                "command/run",
+                json!({"name": "/todos", "argv": [], "session": {"id": "s", "cwd": cwd}}),
+                &mut ask,
+            );
+            let text = r["result"]["text"].as_str().unwrap();
+            assert!(text.contains("0/1 completed") && text.contains("○ #1 one"), "{text}");
+            let list = tool("list", json!({}), cwd)["result"]["content"].as_str().unwrap().to_string();
+            assert!(list.contains("[ ] #1: one"));
+        });
+    }
+
+    #[test]
     fn shutdown_replies_then_exits() {
-        let (reply, exit) = handle(&json!({ "id": 2, "method": "plugin/shutdown" }));
+        let (reply, exit) = handle(&json!({ "id": 2, "method": "plugin/shutdown" }), &mut |_p: &Value| None);
         assert!(reply.is_some() && exit);
     }
 }

@@ -11,8 +11,12 @@ and resets the counter to 1.
 
 ## Commands
 
-`/todos` — renders the list: a `done/total completed` line plus one checkbox
-line (`✓`/`○`) per todo.
+`/todos` — with the `host.ask` capability granted it opens a picker
+("Toggle which todo?") whose options are every todo (`#<id> <text>`, marked
+done/pending) plus "just show". Picking a todo toggles it through the same
+code path as `toggle` and re-renders the list; picking "just show", or any
+ask failure (ungranted capability, timeout, empty answer), falls back to the
+plain render: a `done/total completed` line plus one `✓`/`○` line per todo.
 
 ## State
 
@@ -23,13 +27,15 @@ mutation. The list is stable across sessions in the same cwd.
 
 ## Wire methods
 
-`plugin/manifest`, `tool/call`, `command/run`, `plugin/shutdown`. Protocol 1.1.
-No capabilities, no host→sidecar requests.
+`plugin/manifest`, `tool/call`, `command/run`, `plugin/shutdown`, plus
+sidecar→host `host/ask` for the `/todos` picker. Protocol 1.1. Capability:
+`host.ask` (the command degrades to the text render without it).
 
 ## Install
 
 ```sh
 gray plugin install todo
+gray plugin capabilities todo --all   # grants host.ask → interactive /todos
 ```
 
 ## Develop

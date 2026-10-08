@@ -1,0 +1,17 @@
+[package]
+name = "gray-todo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+description = "Per-project todo list (todo tool + /todos). Port of pi's todo extension."
+
+[[bin]]
+name = "gray-todo"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+strip = true

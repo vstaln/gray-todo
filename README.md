@@ -1,11 +1,20 @@
-# gray-todo
+<p align="center">
+  <img src="assets/gray-logo.svg" alt="gray" width="96">
+</p>
+<h1 align="center">gray-todo</h1>
+<p align="center">A per-project todo list — `todo` tool plus an interactive `/todos` picker.</p>
+<p align="center">
+  <a href="https://github.com/vstaln/gray-todo/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
+  <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
+</p>
 
-Per-project todo list for the agent and the user — a `todo` tool plus a
-`/todos` command. Port of pi's `todo` extension.
+A per-project todo list for the agent and the user — a `todo` tool plus a
+`/todos` command.
 
 ## Tools
 
-`todo` — `{action: "list"|"add"|"toggle"|"clear", text?, id?}` with pi's exact
+`todo` — `{action: "list"|"add"|"toggle"|"clear", text?, id?}` with
 semantics: ids auto-increment, `toggle` flips `done`, `clear` empties the list
 and resets the counter to 1.
 
@@ -20,8 +29,7 @@ plain render: a `done/total completed` line plus one `✓`/`○` line per todo.
 
 ## State
 
-Pi kept todos in session entries so branching rewound them. Gray sidecars have
-no session-entry store, so state persists per project directory at
+State persists per project directory at
 `~/.gray/todos/<sha1-of-cwd>.json` (honors `$GRAY_HOME`), written after every
 mutation. The list is stable across sessions in the same cwd.
 
@@ -45,3 +53,7 @@ cargo test
 gray account check      # entry point + manifest handshake
 gray account publish    # check → build → release → publish to the gray registry
 ```
+
+---
+Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —
+the open-source AI agent harness. <https://gray.alignment.id>

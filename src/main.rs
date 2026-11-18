@@ -43,6 +43,7 @@ fn manifest() -> Value {
             }
         }],
         "commands": ["/todos"],
+        "command_descriptions": {"/todos": "show and toggle the project todo list"},
         "capabilities": ["host.ask"],
     })
 }
